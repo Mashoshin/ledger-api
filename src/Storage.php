@@ -46,16 +46,17 @@ final class Storage
     }
 
     /**
-     * Добавить проводку под эксклюзивной блокировкой и вернуть её же.
+     * Атомарно дописать массив проводок под эксклюзивной блокировкой.
      *
-     * Колбэк получает текущий список проводок и возвращает новую проводку,
-     * которая будет дописана в конец. Чтение и запись происходят под одной
+     * Все переданные проводки добавляются в конец журнала одной записью:
+     * либо все, либо ни одной (запись под единой блокировкой через
+     * временную усечку файла). Чтение и запись происходят под одной
      * блокировкой — так гарантируется отсутствие гонок.
      *
-     * @param callable(array<int, array<string, mixed>>): array<string, mixed> $build
-     * @return array<string, mixed>
+     * @param array<int, array<string, mixed>> $newEntries проводки в порядке добавления
+     * @return array<int, array<string, mixed>> те же проводки
      */
-    public function appendEntry(callable $build): array
+    public function appendEntries(array $newEntries): array
     {
         $this->ensureDir();
 
@@ -78,8 +79,9 @@ final class Storage
                 }
             }
 
-            $entry = $build($entries);
-            $entries[] = $entry;
+            foreach ($newEntries as $entry) {
+                $entries[] = $entry;
+            }
 
             $json = json_encode(
                 ['entries' => $entries],
@@ -94,7 +96,7 @@ final class Storage
             fwrite($handle, $json);
             fflush($handle);
 
-            return $entry;
+            return $newEntries;
         } finally {
             flock($handle, LOCK_UN);
             fclose($handle);

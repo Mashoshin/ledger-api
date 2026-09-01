@@ -21,25 +21,42 @@ final class Ledger
     }
 
     /**
-     * Создать проводку. Валидация выполняется здесь; при нарушении —
-     * ValidationException (роутер вернёт 400).
+     * Создать массив проводок атомарно (всё-или-ничего).
      *
-     * @param array<string, mixed> $input
-     * @return array<string, mixed> созданная проводка
+     * Тело — массив из 1..2 проводок. Сначала валидируются ВСЕ элементы;
+     * при нарушении хотя бы одного — ValidationException (роутер вернёт 400)
+     * и в журнал не пишется ничего. Только после успешной валидации всех
+     * проводок они атомарно дозаписываются в журнал в порядке массива.
+     *
+     * Идемпотентности по payment_id нет: повтор запроса создаёт дубли.
+     *
+     * @param array<mixed> $input массив входных проводок
+     * @return array<int, array<string, mixed>> созданные проводки в том же порядке
      */
-    public function createEntry(array $input): array
+    public function createEntries(array $input): array
     {
-        $debit = Validator::account($input['debit'] ?? null, 'debit');
-        $credit = Validator::account($input['credit'] ?? null, 'credit');
-        $amount = Validator::amount($input['amount'] ?? null);
-        $paymentId = Validator::nonEmptyString($input['payment_id'] ?? null, 'payment_id');
-
-        if ($debit === $credit) {
-            throw new ValidationException('debit and credit must differ');
+        if (!array_is_list($input) || count($input) < 1 || count($input) > 2) {
+            throw new ValidationException('request body must be an array of 1 to 2 entries');
         }
 
-        return $this->storage->appendEntry(static function () use ($paymentId, $debit, $credit, $amount): array {
-            return [
+        // Валидируем и строим ВСЕ проводки до записи — атомарность на уровне
+        // валидации: любая ошибка прерывает обработку до обращения к хранилищу.
+        $built = [];
+        foreach ($input as $item) {
+            if (!is_array($item)) {
+                throw new ValidationException('each entry must be a JSON object');
+            }
+
+            $debit = Validator::account($item['debit'] ?? null, 'debit');
+            $credit = Validator::account($item['credit'] ?? null, 'credit');
+            $amount = Validator::amount($item['amount'] ?? null);
+            $paymentId = Validator::nonEmptyString($item['payment_id'] ?? null, 'payment_id');
+
+            if ($debit === $credit) {
+                throw new ValidationException('debit and credit must differ');
+            }
+
+            $built[] = [
                 'id' => 'ent_' . bin2hex(random_bytes(4)),
                 'payment_id' => $paymentId,
                 'debit' => $debit,
@@ -47,7 +64,9 @@ final class Ledger
                 'amount' => $amount,
                 'created_at' => Clock::now(),
             ];
-        });
+        }
+
+        return $this->storage->appendEntries($built);
     }
 
     /**
