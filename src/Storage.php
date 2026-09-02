@@ -9,8 +9,8 @@ namespace Ledger;
  *
  * Данные хранятся в виде {"entries": [ ... ]}.
  * Файла нет — считается пустым хранилищем и создаётся при первой записи.
- * Запись выполняется атомарно (через временный файл + rename) под
- * эксклюзивной блокировкой, чтобы конкурентные запросы не портили файл.
+ * Проверка на повтор и запись выполняются под одной эксклюзивной блокировкой,
+ * чтобы конкурентные запросы не портили файл и не создавали дублей.
  */
 final class Storage
 {
@@ -46,17 +46,26 @@ final class Storage
     }
 
     /**
-     * Атомарно дописать массив проводок под эксклюзивной блокировкой.
+     * Атомарно дописать массив проводок, если это не повтор.
      *
-     * Все переданные проводки добавляются в конец журнала одной записью:
-     * либо все, либо ни одной (запись под единой блокировкой через
-     * временную усечку файла). Чтение и запись происходят под одной
-     * блокировкой — так гарантируется отсутствие гонок.
+     * Идемпотентность по `payment_id`: если в журнале уже есть проводки хотя бы
+     * с одним из `payment_id` переданных проводок, запрос считается повтором —
+     * в журнал не дописывается ничего, возвращаются ранее записанные проводки
+     * по этим `payment_id` в порядке их записи в журнале. Содержимое повтора
+     * не сверяется: `payment_id` — единственный ключ.
+     *
+     * Проверка на повтор и дозапись выполняются под ОДНИМ захватом flock:
+     * иначе два одновременных запроса с одинаковым `payment_id` оба увидели бы
+     * пустой журнал и оба записали бы проводки.
+     *
+     * Новый `payment_id` — все переданные проводки добавляются в конец журнала
+     * одной записью: либо все, либо ни одной.
      *
      * @param array<int, array<string, mixed>> $newEntries проводки в порядке добавления
-     * @return array<int, array<string, mixed>> те же проводки
+     * @return array{created: bool, entries: array<int, array<string, mixed>>}
+     *         created=true — проводки записаны; false — повтор, отдан журнал
      */
-    public function appendEntries(array $newEntries): array
+    public function appendEntriesIfNew(array $newEntries): array
     {
         $this->ensureDir();
 
@@ -79,6 +88,24 @@ final class Storage
                 }
             }
 
+            // Проверка на повтор — под той же блокировкой, что и запись ниже.
+            $paymentIds = [];
+            foreach ($newEntries as $entry) {
+                $paymentIds[(string) $entry['payment_id']] = true;
+            }
+
+            $alreadyWritten = [];
+            foreach ($entries as $entry) {
+                $paymentId = $entry['payment_id'] ?? null;
+                if (is_string($paymentId) && isset($paymentIds[$paymentId])) {
+                    $alreadyWritten[] = $entry;
+                }
+            }
+
+            if ($alreadyWritten !== []) {
+                return ['created' => false, 'entries' => $alreadyWritten];
+            }
+
             foreach ($newEntries as $entry) {
                 $entries[] = $entry;
             }
@@ -96,7 +123,7 @@ final class Storage
             fwrite($handle, $json);
             fflush($handle);
 
-            return $newEntries;
+            return ['created' => true, 'entries' => $newEntries];
         } finally {
             flock($handle, LOCK_UN);
             fclose($handle);

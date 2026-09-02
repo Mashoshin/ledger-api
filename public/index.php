@@ -10,7 +10,8 @@ namespace Ledger;
  *
  * Маршруты:
  *   GET  /health                     — служебная проверка
- *   POST /entries                    — атомарно записать массив проводок (1..2)
+ *   POST /entries                    — атомарно записать массив проводок (1..2),
+ *                                      идемпотентно по payment_id
  *   GET  /accounts/{id}/balance      — баланс счёта
  */
 
@@ -37,10 +38,11 @@ try {
         return;
     }
 
-    // POST /entries — тело: массив из 1..2 проводок, атомарная запись
+    // POST /entries — тело: массив из 1..2 проводок, атомарная запись.
+    // Идемпотентно по payment_id: повтор — 200 с ранее записанными проводками.
     if ($method === 'POST' && $path === '/entries') {
-        $entries = $ledger->createEntries(Http::jsonBody());
-        Http::json(201, $entries);
+        $result = $ledger->createEntries(Http::jsonBody());
+        Http::json($result['created'] ? 201 : 200, $result['entries']);
         return;
     }
 
